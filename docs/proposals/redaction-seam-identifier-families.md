@@ -1,6 +1,6 @@
 # Proposal: Redaction seam — identifier families (PHI) before persist and before provider egress
 
-**Status:** RFC
+**Status:** RFC — reference implementation in PR #6553 (see *Implementation notes*)
 **Date:** 2026-10-12
 **Refs:** #6468 (credential redaction before providers, opt-in redact-on-write), #3688 (guardrail seam wiring), #5575 (trust tiers + write gate)
 **Context:** `docs/guardrails.md` says enforcement "will get its own explicitly-named seam and its own RFC — it will not silently reuse" the observe-only seam. This is that RFC. It generalises the credential proposal in #6468 to a second pattern class — structured personal and health identifiers (the PHI identifier families) — and fixes the places where each class is applied, so the two proposals ship as one seam instead of two.
@@ -72,13 +72,18 @@ Echo scrubbing: identifier values are short and structured; none qualifies for t
 ### 2. Policy, in config
 
 ```
-redaction.identifiers.projection   off | on            (default off)
-redaction.identifiers.egress       off | on            (default off)
-redaction.on_write                 off | facts | all   (default off; #6468, both classes)
-redaction.on_write_classes         credential | credential+identifier   (default credential)
+redaction.projection_classes   class list | none          (default none)
+redaction.egress_classes       class list | none          (default none)
+redaction.on_write             off | facts | all          (default off; #6468)
+redaction.on_write_classes     class list                 (default credential)
 ```
 
-Keys live in the DB plane next to `write_gate.*` and are registered in the known-keys list. `gbrain config set` accepts them with the strict boolean/enum parsing `eval.scrub_pii` already uses. Credential egress (#6468 item 1) is proposed there as default-on; this RFC takes no position on that default and only adds the identifier switch beside it.
+A class list is comma-separated over `credential`, `identifier`, `contact`.
+Keys live in the DB plane next to `write_gate.*` and are registered in the
+known-keys list; `gbrain config set` refuses an unknown class or mode and
+writes nothing. Credential egress (#6468 item 1) is proposed there as
+default-on; this RFC takes no position on that default — here it is the
+`credential` class in `redaction.egress_classes`, off by default.
 
 ### 3. Projection (chunks, embeddings, evidence)
 
@@ -118,12 +123,15 @@ Placement: in `importFromContent`, after `screenImportContent` and after the `fi
 
 | Key | Values | Default | Effect |
 | --- | --- | --- | --- |
-| `redaction.identifiers.projection` | `off`, `on` | `off` | identifier tokens in chunks, embeddings, evidence |
-| `redaction.identifiers.egress` | `off`, `on` | `off` | identifier tokens in provider-bound text |
+| `redaction.projection_classes` | class list, `none` | `none` | tokens in chunks, embeddings, evidence; setting it re-seals matching pages |
+| `redaction.egress_classes` | class list, `none` | `none` | tokens in provider-bound text |
 | `redaction.on_write` | `off`, `facts`, `all` | `off` | store redacted text at untrusted tiers (#6468) |
-| `redaction.on_write_classes` | `credential`, `credential+identifier` | `credential` | which classes the on-write splice applies |
+| `redaction.on_write_classes` | class list | `credential` | which classes the on-write splice applies |
 
-`gbrain doctor` adds `redaction_projection_pending` (pages waiting for the re-seal after a policy change) and `provider_redaction` (counts per pattern and provider since the last restart; content-free). `docs/guides/write-refusals.md` "What stays raw by design" gains the two sentences that describe what each switch changes.
+`gbrain doctor` adds `redaction_projection_pending` (chunks cut under a
+different class list than the policy names). `docs/guides/write-refusals.md`
+gains a "Redaction policy (opt-in)" section and the "What stays raw by
+design" entry for providers says what the egress switch changes.
 
 ## Rollout
 
@@ -163,3 +171,39 @@ Each step is a separate PR with its own tests; each is a no-op with defaults.
 ## Reference implementation
 
 The identifier families, their guards and 35 synthetic-fixture tests exist today as a standalone MIT shadow-mode provider package for the observe-only seam (`gbrain-phi-guard`). Its detectors are zero-dependency pure functions and can be folded into `secret-scan.ts` under the `identifier` class in step 1; its fixtures (placeholder names, well-known test numbers) carry over as the precision suite. The package itself stays what it is — the visibility layer — and gains nothing from this RFC except a policy to point its operator at.
+
+## Implementation notes
+
+The reference implementation ships with this proposal and differs from the
+text above in four places, each chosen while building it:
+
+1. **Class lists, not per-class booleans.** One key per enforcement point
+   holding a class list (`identifier,contact`) replaced
+   `redaction.identifiers.projection` / `.egress`, so a third class needs no
+   new key. `email` and `phone` are their own `contact` class (open question
+   1): they are common in ordinary notes and the synthetic brain-like fixture
+   contains them, so they are never implied by `identifier`.
+2. **Re-seal on `config set`.** Writing `redaction.projection_classes`
+   re-chunks the pages that match under the old or the new list in the same
+   command, with no provider call, and records the sealed list; the doctor
+   check compares that record with the policy. No new CLI command.
+3. **Counters stay in-process.** `providerRedactionCounts()` and
+   `observeProviderRedactions()` expose per-surface, per-pattern counts; no
+   `provider_redaction` doctor check (a doctor process would always report
+   zero) and nothing persisted.
+4. **On-write covers the page path.** The splice runs in
+   `settleContentDisposition`, which every page write through
+   `importFromContent` crosses (remote `put_page`, capture, connector and
+   inbox imports, sync); the memory verbs' own fact rows (`remember`) are a
+   follow-up, so the acceptance test for a remote `remember` is not yet met.
+
+Modules: `src/core/identifier-patterns.ts`, `src/core/redaction-policy.ts`,
+`src/core/credential-projection.ts` (`retrievalTextProjection`),
+`src/core/ai/provider-redaction.ts`, `src/core/redaction-on-write.ts`,
+`src/core/page-state/redaction-reseal.ts`,
+`src/commands/config/redaction-values.ts`,
+`src/commands/doctor/checks/redaction-projection.ts`. Tests:
+`test/identifier-patterns.test.ts`, `test/redaction-policy.test.ts`,
+`test/redaction-projection.test.ts`, `test/provider-redaction.test.ts`,
+`test/redaction-on-write.test.ts`.
+
